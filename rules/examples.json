@@ -1,0 +1,54 @@
+{
+  "rules": [
+    {
+      "id": "exe-mz-header",
+      "description": "Windows/DOS executable MZ header in the first 2 bytes",
+      "match": "all",
+      "terms": [
+        {
+          "pattern": "4d 5a",
+          "offset_start": 0,
+          "offset_end": 1
+        }
+      ]
+    },
+    {
+      "id": "elf-with-wildcard",
+      "description": "ELF magic with two wildcard bytes, anywhere in the first 64 bytes",
+      "match": "all",
+      "terms": [
+        {
+          "pattern": "7f 45 4c 46 ?? ?? 01",
+          "offset_start": 0,
+          "offset_end": 64
+        }
+      ]
+    },
+    {
+      "id": "combo-marker",
+      "description": "requires both an early magic and a tail marker (any one of two tails)",
+      "match": "all",
+      "terms": [
+        {
+          "pattern": "deadbeef",
+          "offset_start": 0,
+          "offset_end": 256
+        },
+        {
+          "pattern": "baadf00d[4]cafe",
+          "offset_start": 0,
+          "offset_end": -1
+        }
+      ]
+    },
+    {
+      "id": "any-marker",
+      "description": "matches if either anchor string occurs anywhere",
+      "match": "any",
+      "terms": [
+        { "pattern": "68656c6c6f", "offset_start": 0, "offset_end": -1 },
+        { "pattern": "776f726c64", "offset_start": 0, "offset_end": -1 }
+      ]
+    }
+  ]
+}
