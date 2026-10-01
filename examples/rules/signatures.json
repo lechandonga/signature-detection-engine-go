@@ -1,0 +1,38 @@
+{
+  "rules": [
+    {
+      "id": "elf-x86-64",
+      "description": "ELF 64-bit little-endian executable at offset 0",
+      "condition": "all",
+      "patterns": [
+        {"hex": "7f 45 4c 46 02 01 01 ??", "offset": 0}
+      ]
+    },
+    {
+      "id": "zip-entry",
+      "description": "ZIP local file header anywhere in the file",
+      "condition": "all",
+      "patterns": [
+        {"hex": "50 4b 03 04"}
+      ]
+    },
+    {
+      "id": "windows-pe-with-dos-stub",
+      "description": "MZ header at 0 plus PE\\0\\0 signature in the 0x80..0x200 window",
+      "condition": "all",
+      "patterns": [
+        {"hex": "4d 5a", "offset": 0},
+        {"hex": "50 45 00 00", "offset": 128, "window": 384}
+      ]
+    },
+    {
+      "id": "either-marker",
+      "description": "matches when either marker appears",
+      "condition": "any",
+      "patterns": [
+        {"hex": "aa bb cc", "offset": 0, "window": 64},
+        {"hex": "dd ee ff", "offset": 0, "window": 64}
+      ]
+    }
+  ]
+}
