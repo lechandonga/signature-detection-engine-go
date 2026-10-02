@@ -88,8 +88,9 @@ func zipOnlyHits() []engine.Hit {
 func logResult(t *testing.T, res *engine.Result) {
 	t.Helper()
 	out, _ := json.Marshal(res.Hits)
-	t.Logf("rule_set_version=%s file_id=%s status=%s cached=%v hits=%s",
-		res.RuleVersion, res.FileID, res.Status, res.Cached, string(out))
+	t.Logf("rule_set_version=%s file_id=%s status=%s mode=%s basis=%s/%s cached=%v read=%d processed=%d reused=%d size=%d hits=%s",
+		res.RuleVersion, res.FileID, res.Status, res.Mode, res.Basis, res.BasisReason, res.Cached,
+		res.Stats.BytesRead, res.Stats.BytesProcessed, res.Stats.BytesReused, res.Stats.FileSize, string(out))
 }
 
 func sortHits(h []engine.Hit) {
@@ -258,8 +259,8 @@ func TestCacheBoundToVersionAndContent(t *testing.T) {
 	if set.Version == oldVersion {
 		t.Fatalf("reload must produce a new version, got %s", set.Version)
 	}
-	if eng.CacheStats() != 0 {
-		t.Fatalf("old-version cache entries must be evicted, size=%d", eng.CacheStats())
+	if entries, _ := eng.CacheStats(); entries != 0 {
+		t.Fatalf("old-version cache entries must be evicted, size=%d", entries)
 	}
 	fourth := eng.Scan(target)
 	logResult(t, fourth)

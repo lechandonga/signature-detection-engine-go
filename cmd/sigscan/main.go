@@ -16,6 +16,8 @@ func main() {
 	rulesFlag := flag.String("rules", "", "comma-separated rule files, or @rules.txt for a list file")
 	chunk := flag.Int("chunk-size", 4096, "streaming read chunk size in bytes")
 	reload := flag.Bool("reload", false, "load rules, print the rule report and exit")
+	cacheMax := flag.Int64("cache-max-bytes", 64<<20,
+		"basis cache capacity counted in represented file bytes; negative means unlimited")
 	flag.Parse()
 
 	paths := strings.FieldsFunc(*rulesFlag, func(r rune) bool { return r == ',' })
@@ -32,7 +34,7 @@ func main() {
 		fatal(fmt.Errorf("at least one --rules file is required"))
 	}
 
-	eng, err := engine.New(engine.Config{RulePaths: paths, ChunkSize: *chunk})
+	eng, err := engine.New(engine.Config{RulePaths: paths, ChunkSize: *chunk, CacheMaxBytes: *cacheMax})
 	if err != nil {
 		fatal(err)
 	}
@@ -55,6 +57,13 @@ func main() {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(results); err != nil {
 		fatal(err)
+	}
+
+	for _, r := range results {
+		fmt.Fprintf(os.Stderr,
+			"sigscan: rule_version=%s file_id=%s status=%s mode=%s basis=%s read=%d processed=%d reused=%d hits=%d\n",
+			r.RuleVersion, r.FileID, r.Status, r.Mode, r.Basis,
+			r.Stats.BytesRead, r.Stats.BytesProcessed, r.Stats.BytesReused, len(r.Hits))
 	}
 
 	for _, r := range results {

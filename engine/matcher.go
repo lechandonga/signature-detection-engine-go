@@ -142,6 +142,57 @@ func (m *streamMatcher) finish() []Hit {
 	return hits
 }
 
+// matcherState is an immutable-ish checkpoint of a matcher after it has
+// consumed a prefix of a file. Restoring it and writing only the appended
+// suffix produces exactly the same matches as scanning the whole file,
+// because the carried tail contains every byte a cross-boundary match can
+// depend on.
+type matcherState struct {
+	tail    []byte
+	pos     int64
+	tailLen int
+	matches [][]termMatch
+	seen    []map[uint64]struct{}
+}
+
+// snapshot captures the matcher's state. The returned state owns private
+// copies; it is safe to keep using the matcher afterwards.
+func (m *streamMatcher) snapshot() *matcherState {
+	st := &matcherState{
+		pos:     m.pos,
+		tailLen: m.tailLen,
+		tail:    make([]byte, len(m.tail)),
+		matches: make([][]termMatch, len(m.matches)),
+		seen:    make([]map[uint64]struct{}, len(m.seen)),
+	}
+	copy(st.tail, m.tail)
+	for ri := range m.matches {
+		st.matches[ri] = append([]termMatch(nil), m.matches[ri]...)
+		st.seen[ri] = make(map[uint64]struct{}, len(m.seen[ri]))
+		for k, v := range m.seen[ri] {
+			st.seen[ri][k] = v
+		}
+	}
+	return st
+}
+
+// restoreMatcher builds a fresh matcher over set whose state equals st. The
+// state must have been produced for the same rule set; callers only ever
+// restore entries keyed by the active rule version.
+func restoreMatcher(set *rules.Set, st *matcherState) *streamMatcher {
+	m := newStreamMatcher(set)
+	m.pos = st.pos
+	m.tailLen = st.tailLen
+	copy(m.tail, st.tail)
+	for ri := range m.matches {
+		m.matches[ri] = append([]termMatch(nil), st.matches[ri]...)
+		for k, v := range st.seen[ri] {
+			m.seen[ri][k] = v
+		}
+	}
+	return m
+}
+
 // combineTerms turns per-term occurrence lists into one offset per rule
 // occurrence. For "all" the rule fires at each occurrence of the first term
 // provided every other term also occurs at least once anywhere in the file;
