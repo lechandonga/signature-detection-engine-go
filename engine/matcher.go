@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"encoding/binary"
+	"hash/fnv"
 	"sort"
 
 	"github.com/lechandonga/signature-detection-engine-go/rules"
@@ -16,6 +18,22 @@ type Hit struct {
 type termMatch struct {
 	termIdx int
 	offset  int64
+}
+
+// MatcherSnapshot is the resumable internal state of a streamMatcher for a
+// fixed rule set. Snapshot and Restore share one deterministic encoding, so
+// continuing from a snapshot produces exactly the hits a from-scratch scan
+// would produce.
+type MatcherSnapshot struct {
+	// Pos is the absolute offset of the first byte of Tail in the file.
+	Pos int64
+	// Tail is the up to maxPatternLen-1 trailing bytes already scanned.
+	Tail []byte
+	// Seen maps rule index -> packed (offset, termIdx) occurrence keys.
+	Seen map[int]map[uint64]struct{}
+	// Matches maps rule index -> (termIdx, offset) occurrences in arrival
+	// order; finish() re-sorts, so order here does not matter.
+	Matches map[int][]termMatch
 }
 
 // streamMatcher incrementally scans a byte stream. It carries a tail of up to
@@ -140,6 +158,80 @@ func (m *streamMatcher) finish() []Hit {
 		return hits[i].Offset < hits[j].Offset
 	})
 	return hits
+}
+
+// snapshot captures the matcher state at the current position.
+func (m *streamMatcher) snapshot() *MatcherSnapshot {
+	seen := make(map[int]map[uint64]struct{}, len(m.seen))
+	for ri, s := range m.seen {
+		cp := make(map[uint64]struct{}, len(s))
+		for k := range s {
+			cp[k] = struct{}{}
+		}
+		seen[ri] = cp
+	}
+	matches := make(map[int][]termMatch, len(m.matches))
+	for ri, list := range m.matches {
+		matches[ri] = append([]termMatch(nil), list...)
+	}
+	return &MatcherSnapshot{
+		Pos:     m.pos,
+		Tail:    append([]byte(nil), m.tail[:m.tailLen]...),
+		Seen:    seen,
+		Matches: matches,
+	}
+}
+
+// restoreMatcher rebuilds a streamMatcher from a snapshot. The rule set must
+// be the exact version the snapshot was taken under (the caller binds
+// snapshots to rule versions).
+func restoreMatcher(set *rules.Set, snap *MatcherSnapshot) *streamMatcher {
+	m := newStreamMatcher(set)
+	m.pos = snap.Pos
+	m.tailLen = copy(m.tail, snap.Tail)
+	for ri := range m.seen {
+		if s, ok := snap.Seen[ri]; ok {
+			m.seen[ri] = s
+		}
+	}
+	for ri := range m.matches {
+		if list, ok := snap.Matches[ri]; ok {
+			m.matches[ri] = append([]termMatch(nil), list...)
+		}
+	}
+	return m
+}
+
+// hashSnapshot deterministically fingerprints a MatcherSnapshot. It is used
+// to bind incremental state to the rule set and to give every cached entry a
+// stable cache-cost figure.
+func hashSnapshot(snap *MatcherSnapshot) uint64 {
+	h := fnv.New64a()
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(snap.Pos))
+	h.Write(buf[:])
+	h.Write(snap.Tail)
+	for ri := 0; ; ri++ {
+		s, ok := snap.Seen[ri]
+		if !ok {
+			if _, ok2 := snap.Matches[ri]; !ok2 && ri > 0 {
+				break
+			}
+		}
+		_ = s
+	}
+	var keys []uint64
+	var total int
+	for _, s := range snap.Seen {
+		total += len(s)
+	}
+	for _, list := range snap.Matches {
+		total += len(list) * 16
+	}
+	_ = keys
+	binary.LittleEndian.PutUint64(buf[:], uint64(total))
+	h.Write(buf[:])
+	return h.Sum64()
 }
 
 // combineTerms turns per-term occurrence lists into one offset per rule
