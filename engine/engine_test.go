@@ -12,6 +12,26 @@ import (
 	"github.com/lechandonga/signature-detection-engine-go/engine"
 )
 
+// atomicWriteRules replaces a rule file via temp-file + rename so a
+// concurrent Reload never observes a half-written document.
+func atomicWriteRules(t *testing.T, path, body string) {
+	t.Helper()
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".rules-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tmp.WriteString(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 const testRules = `{
   "rules": [
     {"id": "zip", "description": "ZIP header", "condition": "all",
@@ -248,9 +268,7 @@ func TestCacheBoundToVersionAndContent(t *testing.T) {
 	}
 
 	oldVersion := first.RuleVersion
-	if err := os.WriteFile(rp, []byte(zipOnlyRules), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	atomicWriteRules(t, rp, zipOnlyRules)
 	set, err := eng.Reload()
 	if err != nil {
 		t.Fatal(err)
@@ -272,9 +290,7 @@ func TestCacheBoundToVersionAndContent(t *testing.T) {
 		}
 	}
 
-	if err := os.WriteFile(rp, []byte(testRules), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	atomicWriteRules(t, rp, testRules)
 	if _, err := eng.Reload(); err != nil {
 		t.Fatal(err)
 	}
@@ -335,8 +351,19 @@ func TestConcurrentScansAndHotReload(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := os.WriteFile(rp, []byte(zipOnlyRules), 0o644); err != nil {
+				dir := filepath.Dir(rp)
+				tmp, err := os.CreateTemp(dir, ".rules-*.json")
+				if err != nil {
 					record("write rules: %v", err)
+					return
+				}
+				if _, err := tmp.WriteString(zipOnlyRules); err != nil {
+					record("write rules: %v", err)
+					return
+				}
+				tmp.Close()
+				if err := os.Rename(tmp.Name(), rp); err != nil {
+					record("rename rules: %v", err)
 					return
 				}
 				if _, err := eng.Reload(); err != nil {
@@ -348,8 +375,19 @@ func TestConcurrentScansAndHotReload(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := os.WriteFile(rp, []byte(testRules), 0o644); err != nil {
+				dir := filepath.Dir(rp)
+				tmp, err := os.CreateTemp(dir, ".rules-*.json")
+				if err != nil {
 					record("write rules: %v", err)
+					return
+				}
+				if _, err := tmp.WriteString(testRules); err != nil {
+					record("write rules: %v", err)
+					return
+				}
+				tmp.Close()
+				if err := os.Rename(tmp.Name(), rp); err != nil {
+					record("rename rules: %v", err)
 					return
 				}
 				if _, err := eng.Reload(); err != nil {
@@ -363,9 +401,7 @@ func TestConcurrentScansAndHotReload(t *testing.T) {
 		t.Error(msg)
 	}
 
-	if err := os.WriteFile(rp, []byte(testRules), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	atomicWriteRules(t, rp, testRules)
 	if _, err := eng.Reload(); err != nil {
 		t.Fatal(err)
 	}

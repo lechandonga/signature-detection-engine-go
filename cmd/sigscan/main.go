@@ -15,6 +15,7 @@ import (
 func main() {
 	rulesFlag := flag.String("rules", "", "comma-separated rule files, or @rules.txt for a list file")
 	chunk := flag.Int("chunk-size", 4096, "streaming read chunk size in bytes")
+	cacheBytes := flag.Int64("cache-bytes", 0, "bounded cache/resume-progress capacity in accounted bytes (0 = unlimited)")
 	reload := flag.Bool("reload", false, "load rules, print the rule report and exit")
 	flag.Parse()
 
@@ -32,7 +33,7 @@ func main() {
 		fatal(fmt.Errorf("at least one --rules file is required"))
 	}
 
-	eng, err := engine.New(engine.Config{RulePaths: paths, ChunkSize: *chunk})
+	eng, err := engine.New(engine.Config{RulePaths: paths, ChunkSize: *chunk, CacheLimitBytes: *cacheBytes})
 	if err != nil {
 		fatal(err)
 	}
@@ -55,6 +56,16 @@ func main() {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(results); err != nil {
 		fatal(err)
+	}
+
+	for _, r := range results {
+		fmt.Fprintf(os.Stderr,
+			"sigscan: version=%s file=%s status=%s mode=%s progress=%s hits=%d "+
+				"bytes_read=%d bytes_processed=%d bytes_reused=%d bytes_verified=%d "+
+				"cache_entries=%d cache_cost=%d cache_limit=%d cache_evictions=%d\n",
+			r.RuleVersion, r.FileID, r.Status, r.Mode, r.Progress, len(r.Hits),
+			r.Work.BytesRead, r.Work.BytesProcessed, r.Work.BytesReused, r.Work.BytesVerified,
+			r.Work.CacheEntries, r.Work.CacheCostBytes, r.Work.CacheLimitBytes, r.Work.CacheEvictions)
 	}
 
 	for _, r := range results {

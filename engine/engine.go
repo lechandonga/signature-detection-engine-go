@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,19 +18,11 @@ import (
 type Status string
 
 const (
-	// StatusOK means the file was fully scanned and Hits are trustworthy.
-	StatusOK Status = "OK"
-	// StatusUnreadable means the file could not be opened at all.
+	StatusOK         Status = "OK"
 	StatusUnreadable Status = "FILE_UNREADABLE"
-	// StatusTruncated means reading ended before the initially observed size
-	// (e.g. the file shrank between stat and read).
-	StatusTruncated Status = "FILE_TRUNCATED"
-	// StatusModified means the file changed during scanning, as proven by a
-	// final verification hash that differs from the streamed content hash.
-	StatusModified Status = "FILE_MODIFIED_DURING_SCAN"
-	// StatusPanic means an unexpected internal failure while scanning the
-	// file; it never aborts the rest of the batch.
-	StatusPanic Status = "SCAN_INTERNAL_ERROR"
+	StatusTruncated  Status = "FILE_TRUNCATED"
+	StatusModified   Status = "FILE_MODIFIED_DURING_SCAN"
+	StatusPanic      Status = "SCAN_INTERNAL_ERROR"
 )
 
 // Result is the scan outcome for a single file.
@@ -41,28 +34,37 @@ type Result struct {
 	RuleVersion string `json:"rule_version"`
 	Hits        []Hit  `json:"hits"`
 	ContentHash string `json:"content_hash,omitempty"`
-	Cached      bool   `json:"cached"`
+	// Cached is kept for backward compatibility: it is true exactly when the
+	// result was reused without reading any file content (mode == "cached").
+	Cached   bool             `json:"cached"`
+	Mode     ScanMode         `json:"mode"`
+	Progress ProgressReaction `json:"progress,omitempty"`
+	Work     WorkStats        `json:"work"`
 }
 
 // FileIDer maps a path to a stable identifier. By default the absolute path
 // is used.
 type FileIDer func(path string) string
 
-// Engine owns the active rule snapshot and the content/version-bound result
-// cache. All methods are safe for concurrent use; Reload may run while scans
-// are in flight.
+// Engine owns the active rule snapshot, resume progress and the bounded
+// result cache. All methods are safe for concurrent use; Reload may run while
+// scans are in flight.
 type Engine struct {
-	rulePaths []string
-	idFor     FileIDer
-	chunkSize int
+	rulePaths  []string
+	idFor      FileIDer
+	chunkSize  int
+	cacheLimit int64
 
-	mu       sync.RWMutex
-	active   *rules.Set
-	cache    map[string]*Result // key: ruleVersion + "\x00" + contentHash + "\x00" + fileID
-	inflight sync.Map           // same key -> *call
+	mu     sync.RWMutex
+	active *rules.Set
+	store  *entryStore
 
-	// onChunk is invoked after each streamed chunk is processed. It exists
-	// for tests that must deterministically mutate a file mid-scan.
+	// Scans of one file id are serialized so two goroutines can never resume
+	// from the same stored progress concurrently. Different files still run
+	// in parallel.
+	scanMu    sync.Mutex
+	scanLocks map[string]*sync.Mutex
+
 	onChunk func(path string, chunkIndex int)
 }
 
@@ -70,7 +72,10 @@ type Engine struct {
 type Config struct {
 	RulePaths []string
 	FileID    FileIDer
-	ChunkSize int // streaming read size; <=0 means 4096
+	ChunkSize int
+	// CacheLimitBytes bounds the accounted cost of cached results and resume
+	// progress. <=0 means unlimited. Eviction affects speed only, never hits.
+	CacheLimitBytes int64
 }
 
 // New loads the initial rule set and builds an Engine.
@@ -89,10 +94,12 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}
 	e := &Engine{
-		rulePaths: append([]string(nil), cfg.RulePaths...),
-		idFor:     idFor,
-		chunkSize: chunk,
-		cache:     map[string]*Result{},
+		rulePaths:  append([]string(nil), cfg.RulePaths...),
+		idFor:      idFor,
+		chunkSize:  chunk,
+		cacheLimit: cfg.CacheLimitBytes,
+		store:      newEntryStore(cfg.CacheLimitBytes),
+		scanLocks:  map[string]*sync.Mutex{},
 	}
 	set, err := rules.LoadFiles(e.rulePaths)
 	if err != nil {
@@ -109,46 +116,23 @@ func (e *Engine) Rules() *rules.Set {
 	return e.active
 }
 
-// Reload recompiles all rule files and atomically swaps the snapshot. Old
-// results stay bound to the old version and can never be returned under the
-// new version; cache entries of superseded versions are evicted.
+// Reload recompiles all rule files and atomically swaps the snapshot. Resume
+// progress and cached results of superseded versions are dropped, so new
+// rules apply to the whole file on the next scan.
 func (e *Engine) Reload() (*rules.Set, error) {
 	set, err := rules.LoadFiles(e.rulePaths)
 	if err != nil {
 		return nil, err
 	}
 	e.mu.Lock()
-	old := e.active
 	e.active = set
-	e.pruneCacheLocked()
 	e.mu.Unlock()
-	_ = old
+	e.store.pruneVersion(set.Version)
 	return set, nil
 }
 
-// pruneCacheLocked drops entries that do not belong to the active version.
-func (e *Engine) pruneCacheLocked() {
-	prefix := e.active.Version + "\x00"
-	for k := range e.cache {
-		if len(k) <= len(prefix) || k[:len(prefix)] != prefix {
-			delete(e.cache, k)
-		}
-	}
-}
-
-func (e *Engine) cacheKey(version, hash, fileID string) string {
-	return version + "\x00" + hash + "\x00" + fileID
-}
-
-// call deduplicates concurrent scans of the same key (singleflight).
-type call struct {
-	done chan struct{}
-	res  *Result
-}
-
-// ScanBatch scans many files concurrently. One file's failure never affects
-// the others. The returned slice is in the same order as paths, so output is
-// reproducible regardless of concurrency.
+// ScanBatch scans many files concurrently; one file's failure never affects
+// the others. The returned slice is in input order.
 func (e *Engine) ScanBatch(paths []string) []*Result {
 	results := make([]*Result, len(paths))
 	var wg sync.WaitGroup
@@ -163,87 +147,143 @@ func (e *Engine) ScanBatch(paths []string) []*Result {
 	return results
 }
 
-// Scan scans one file, reusing a cached judgment when the same rule version
-// and file content have already been evaluated. Cache hits return a defensive
-// copy and only set the Cached flag; Hits are identical either way.
+func (e *Engine) scanLockFor(fileID string) *sync.Mutex {
+	e.scanMu.Lock()
+	defer e.scanMu.Unlock()
+	m, ok := e.scanLocks[fileID]
+	if !ok {
+		m = &sync.Mutex{}
+		e.scanLocks[fileID] = m
+	}
+	return m
+}
+
+// Scan scans one file with append-only incremental resume. Progress is
+// resumed only when the same file identity grew and its already-scanned
+// prefix hashes identically; truncation, in-place rewrite, replacement,
+// rule reload or eviction force a full rescan distinguishable via
+// Result.Mode and Result.Progress.
 func (e *Engine) Scan(path string) (result *Result) {
 	fileID := e.idFor(path)
 	set := e.Rules()
-	flightKey := set.Version + "\x01" + fileID
 
-	// Concurrent scans of the same file under the same rule version share a
-	// single computation (singleflight).
-	c := &call{done: make(chan struct{})}
-	if actual, loaded := e.inflight.LoadOrStore(flightKey, c); loaded {
-		<-actual.(*call).done
-		cp := *actual.(*call).res
-		cp.Hits = append([]Hit(nil), cp.Hits...)
-		cp.Cached = true
-		return &cp
-	}
-	defer func() {
-		c.res = result
-		close(c.done)
-		e.inflight.Delete(flightKey)
-	}()
+	lock := e.scanLockFor(fileID)
+	lock.Lock()
+	defer lock.Unlock()
 
 	defer func() {
 		if r := recover(); r != nil {
-			result = &Result{
-				FileID:      fileID,
-				Path:        path,
-				Status:      StatusPanic,
-				Error:       fmt.Sprintf("panic: %v", r),
-				RuleVersion: set.Version,
-				Hits:        []Hit{},
-			}
+			result = e.finishWork(&Result{
+				FileID: fileID, Path: path, Status: StatusPanic,
+				Error: fmt.Sprintf("panic: %v", r), RuleVersion: set.Version,
+				Hits: []Hit{}, Mode: ModeFull,
+			})
 		}
 	}()
 
-	res, fresh := e.scanOnce(path, fileID, set)
-	if !fresh {
-		cp := *res
-		cp.Hits = append([]Hit(nil), res.Hits...)
-		cp.Cached = true
-		result = &cp
-		return result
-	}
-	result = res
-	return result
-}
-
-func (e *Engine) scanOnce(path, fileID string, set *rules.Set) (*Result, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return &Result{
-			FileID: fileID, Path: path, Status: StatusUnreadable,
-			Error: err.Error(), RuleVersion: set.Version, Hits: []Hit{},
-		}, true
+		return e.finishWork(errResult(fileID, path, set.Version, StatusUnreadable, err))
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
-		return &Result{
-			FileID: fileID, Path: path, Status: StatusUnreadable,
-			Error: err.Error(), RuleVersion: set.Version, Hits: []Hit{},
-		}, true
+		return e.finishWork(errResult(fileID, path, set.Version, StatusUnreadable, err))
 	}
 	expectedSize := fi.Size()
+	ident := fileIdentityOf(fi)
+	modTime := fi.ModTime()
 
-	matcher := newStreamMatcher(set)
-	h := sha256.New()
+	entry := e.store.get(set.Version, fileID)
+
+	// Fast path: identity, size and mtime unchanged since the last complete
+	// scan — reuse the result without reading file content.
+	if entry != nil && entry.usable() && entry.identity == ident &&
+		entry.size == expectedSize && entry.modTime.Equal(modTime) {
+		cp := copyResult(entry.res)
+		cp.Cached = true
+		cp.Mode = ModeCached
+		cp.Progress = ProgressReused
+		cp.Work = WorkStats{
+			Mode: ModeCached, Progress: ProgressReused,
+			BytesReused: expectedSize,
+		}
+		e.store.touch(set.Version, fileID)
+		return e.finishWork(cp)
+	}
+
+	var (
+		matcher       *streamMatcher
+		contentHash   hash.Hash
+		startPos      int64
+		mode          = ModeFull
+		reaction      ProgressReaction
+		bytesVerified int64
+	)
+
+	switch {
+	case entry == nil:
+		if e.store.wasEvicted(set.Version, fileID) {
+			reaction = ProgressEvicted
+		} else {
+			reaction = ProgressNew
+		}
+	case !entry.usable():
+		reaction = ProgressEvicted
+	case ident.ok && entry.identity.ok && entry.identity != ident:
+		reaction = ProgressInvalidatedReplaced
+	case expectedSize < entry.size:
+		reaction = ProgressInvalidatedTruncated
+	case expectedSize == entry.size && !modTime.Equal(entry.modTime):
+		reaction = ProgressInvalidatedRewritten
+	case expectedSize > entry.size:
+		// Grew: independently hash the already-scanned prefix. This catches
+		// a rewrite-then-append that kept a growing size and proves that
+		// stored matcher state still describes the file's prefix exactly.
+		ph, n, perr := hashRange(f, 0, entry.size)
+		bytesVerified += n
+		if perr == nil && ph == entry.prefixHash {
+			if restored := restoreMatcherMaybe(set, entry.snapshot); restored != nil {
+				if rh := restoreHash(entry.hashState); rh != nil {
+					matcher = restored
+					contentHash = rh
+					startPos = entry.size
+					mode = ModeIncremental
+					reaction = ProgressResumed
+				}
+			}
+		}
+		if mode != ModeIncremental {
+			reaction = ProgressInvalidatedPrefix
+		}
+	default:
+		reaction = ProgressInvalidatedRewritten
+	}
+
+	if mode == ModeFull {
+		matcher = newStreamMatcher(set)
+		contentHash = sha256.New()
+		startPos = 0
+	}
+
+	if startPos > 0 {
+		if _, serr := f.Seek(startPos, io.SeekStart); serr != nil {
+			return e.finishWork(errResult(fileID, path, set.Version, StatusUnreadable, serr))
+		}
+	}
+
 	buf := make([]byte, e.chunkSize)
-	var readTotal int64
+	var readBytes, processedBytes int64
 	chunkIndex := 0
 
 	for {
 		n, rerr := f.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
-			matcher.write(chunk)
-			h.Write(chunk)
-			readTotal += int64(n)
+			processedBytes += int64(matcher.write(chunk))
+			contentHash.Write(chunk)
+			readBytes += int64(n)
 			chunkIndex++
 			if e.onChunk != nil {
 				e.onChunk(path, chunkIndex)
@@ -253,37 +293,45 @@ func (e *Engine) scanOnce(path, fileID string, set *rules.Set) (*Result, bool) {
 			break
 		}
 		if rerr != nil {
-			return &Result{
-				FileID: fileID, Path: path, Status: StatusUnreadable,
-				Error: rerr.Error(), RuleVersion: set.Version, Hits: []Hit{},
-			}, true
+			return e.finishWork(errResult(fileID, path, set.Version, StatusUnreadable, rerr))
 		}
 	}
 
-	if readTotal < expectedSize {
-		return &Result{
+	finalSize := startPos + readBytes
+	if readBytes < expectedSize-startPos {
+		return e.finishWork(&Result{
 			FileID: fileID, Path: path, Status: StatusTruncated,
-			Error:       fmt.Sprintf("expected %d bytes but read %d", expectedSize, readTotal),
-			RuleVersion: set.Version, Hits: []Hit{},
-		}, true
+			Error:       fmt.Sprintf("expected %d bytes but read %d", expectedSize, finalSize),
+			RuleVersion: set.Version, Hits: []Hit{}, Mode: mode, Progress: reaction,
+		})
 	}
 
-	// Verification pass: re-read the whole file independently and compare
-	// hashes. A mismatch proves the content changed during scanning.
-	verify, err := hashFile(path)
-	if err != nil {
-		return &Result{
-			FileID: fileID, Path: path, Status: StatusUnreadable,
-			Error: err.Error(), RuleVersion: set.Version, Hits: []Hit{},
-		}, true
+	// Independent verification of the complete current file. A size move or
+	// hash mismatch proves the file changed while scanning: no hits are
+	// returned and the status stays distinguishable from OK, so the caller
+	// must rescan. This also covers appends racing an incremental scan.
+	curFI, statErr := f.Stat()
+	verifyHash, verifyN, verr := hashFileAll(path)
+	bytesVerified += verifyN
+	if statErr != nil {
+		return e.finishWork(errResult(fileID, path, set.Version, StatusUnreadable, statErr))
 	}
-	streamHash := hex.EncodeToString(h.Sum(nil))
-	if verify != streamHash {
-		return &Result{
+	if verr != nil {
+		return e.finishWork(errResult(fileID, path, set.Version, StatusUnreadable, verr))
+	}
+	streamHash := hex.EncodeToString(contentHash.Sum(nil))
+	if curFI.Size() != expectedSize || finalSize != expectedSize || verifyHash != streamHash {
+		return e.finishWork(&Result{
 			FileID: fileID, Path: path, Status: StatusModified,
-			Error:       fmt.Sprintf("content hash changed while scanning: streamed=%s verified=%s", streamHash, verify),
-			RuleVersion: set.Version, Hits: []Hit{},
-		}, true
+			Error: fmt.Sprintf("file changed while scanning: stat_size=%d streamed=%d current=%d streamed_hash=%s verified_hash=%s",
+				expectedSize, finalSize, curFI.Size(), streamHash, verifyHash),
+			RuleVersion: set.Version, Hits: []Hit{}, Mode: mode, Progress: reaction,
+			Work: WorkStats{
+				Mode: mode, Progress: reaction, BytesRead: readBytes,
+				BytesProcessed: processedBytes, BytesReused: startPos,
+				BytesVerified: bytesVerified,
+			},
+		})
 	}
 
 	res := &Result{
@@ -293,42 +341,65 @@ func (e *Engine) scanOnce(path, fileID string, set *rules.Set) (*Result, bool) {
 		RuleVersion: set.Version,
 		Hits:        matcher.finish(),
 		ContentHash: streamHash,
-		Cached:      false,
+		Mode:        mode,
+		Progress:    reaction,
 	}
 
-	return e.storeOrReuse(set.Version, streamHash, fileID, res)
-}
+	snap := matcher.snapshot()
+	hashState, _ := contentHash.(interface {
+		MarshalBinary() ([]byte, error)
+	}).MarshalBinary()
 
-// storeOrReuse caches the computed result keyed by rule version, content
-// hash and file id. Every caller receives its own copy.
-func (e *Engine) storeOrReuse(version, hash, fileID string, computed *Result) (*Result, bool) {
-	key := e.cacheKey(version, hash, fileID)
+	e.store.put(&cacheEntry{
+		version:    set.Version,
+		fileID:     fileID,
+		identity:   ident,
+		size:       finalSize,
+		modTime:    modTime,
+		res:        copyResult(res),
+		snapshot:   snap,
+		hashState:  hashState,
+		prefixHash: streamHash,
+		cost:       entryCost(finalSize, snap),
+	})
 
-	e.mu.Lock()
-	if cached, ok := e.cache[key]; ok {
-		e.mu.Unlock()
-		return cached, false
+	res.Work = WorkStats{
+		Mode: mode, Progress: reaction,
+		BytesRead: readBytes, BytesProcessed: processedBytes,
+		BytesReused: startPos, BytesVerified: bytesVerified,
 	}
-	e.cache[key] = computed
-	e.mu.Unlock()
-
-	return computed, true
+	return e.finishWork(res)
 }
 
-func hashFile(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
+func (e *Engine) finishWork(r *Result) *Result {
+	if r.Hits == nil {
+		r.Hits = []Hit{}
 	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
+	entries, used, limit, evicted := e.store.stats()
+	r.Work.CacheEntries = entries
+	r.Work.CacheCostBytes = used
+	r.Work.CacheLimitBytes = limit
+	r.Work.CacheEvictions = evicted
+	if r.Work.Mode == "" {
+		r.Work.Mode = r.Mode
+	}
+	if r.Work.Progress == "" {
+		r.Work.Progress = r.Progress
+	}
+	return r
 }
 
-// CacheStats reports the current cache size (mostly useful in tests).
-func (e *Engine) CacheStats() int {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return len(e.cache)
+func errResult(fileID, path, version string, st Status, err error) *Result {
+	return &Result{
+		FileID: fileID, Path: path, Status: st, Error: err.Error(),
+		RuleVersion: version, Hits: []Hit{}, Mode: ModeFull,
+	}
+}
+
+func copyResult(r *Result) *Result {
+	cp := *r
+	cp.Hits = append([]Hit(nil), r.Hits...)
+	return &cp
 }
 
 // SetOnChunk installs (or clears with nil) a callback fired after each
@@ -336,4 +407,10 @@ func (e *Engine) CacheStats() int {
 // it is being scanned.
 func (e *Engine) SetOnChunk(fn func(path string, chunkIndex int)) {
 	e.onChunk = fn
+}
+
+// CacheStats reports the current number of cached entries.
+func (e *Engine) CacheStats() int {
+	entries, _, _, _ := e.store.stats()
+	return entries
 }
