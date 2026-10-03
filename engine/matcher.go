@@ -1,8 +1,6 @@
 package engine
 
 import (
-	"encoding/binary"
-	"hash/fnv"
 	"sort"
 
 	"github.com/lechandonga/signature-detection-engine-go/rules"
@@ -189,9 +187,16 @@ func restoreMatcher(set *rules.Set, snap *MatcherSnapshot) *streamMatcher {
 	m := newStreamMatcher(set)
 	m.pos = snap.Pos
 	m.tailLen = copy(m.tail, snap.Tail)
+	if m.tail == nil {
+		m.tail = make([]byte, m.maxLen-1)
+	}
 	for ri := range m.seen {
 		if s, ok := snap.Seen[ri]; ok {
-			m.seen[ri] = s
+			cp := make(map[uint64]struct{}, len(s))
+			for k := range s {
+				cp[k] = struct{}{}
+			}
+			m.seen[ri] = cp
 		}
 	}
 	for ri := range m.matches {
@@ -200,38 +205,6 @@ func restoreMatcher(set *rules.Set, snap *MatcherSnapshot) *streamMatcher {
 		}
 	}
 	return m
-}
-
-// hashSnapshot deterministically fingerprints a MatcherSnapshot. It is used
-// to bind incremental state to the rule set and to give every cached entry a
-// stable cache-cost figure.
-func hashSnapshot(snap *MatcherSnapshot) uint64 {
-	h := fnv.New64a()
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], uint64(snap.Pos))
-	h.Write(buf[:])
-	h.Write(snap.Tail)
-	for ri := 0; ; ri++ {
-		s, ok := snap.Seen[ri]
-		if !ok {
-			if _, ok2 := snap.Matches[ri]; !ok2 && ri > 0 {
-				break
-			}
-		}
-		_ = s
-	}
-	var keys []uint64
-	var total int
-	for _, s := range snap.Seen {
-		total += len(s)
-	}
-	for _, list := range snap.Matches {
-		total += len(list) * 16
-	}
-	_ = keys
-	binary.LittleEndian.PutUint64(buf[:], uint64(total))
-	h.Write(buf[:])
-	return h.Sum64()
 }
 
 // combineTerms turns per-term occurrence lists into one offset per rule

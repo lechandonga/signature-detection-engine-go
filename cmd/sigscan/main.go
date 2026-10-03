@@ -15,6 +15,9 @@ import (
 func main() {
 	rulesFlag := flag.String("rules", "", "comma-separated rule files, or @rules.txt for a list file")
 	chunk := flag.Int("chunk-size", 4096, "streaming read chunk size in bytes")
+	maxCache := flag.Int("max-cache-bytes", 0, "cap on continuation/cache memory in bytes; 0 = unbounded")
+	verifyLen := flag.Int("verify-len", 4096, "bounded prefix bytes hashed before trusting a continuation")
+	quiet := flag.Bool("quiet", false, "suppress per-file workload summary on stderr")
 	reload := flag.Bool("reload", false, "load rules, print the rule report and exit")
 	flag.Parse()
 
@@ -32,7 +35,10 @@ func main() {
 		fatal(fmt.Errorf("at least one --rules file is required"))
 	}
 
-	eng, err := engine.New(engine.Config{RulePaths: paths, ChunkSize: *chunk})
+	eng, err := engine.New(engine.Config{
+		RulePaths: paths, ChunkSize: *chunk,
+		MaxCacheBytes: *maxCache, VerifyLen: *verifyLen,
+	})
 	if err != nil {
 		fatal(err)
 	}
@@ -57,8 +63,19 @@ func main() {
 		fatal(err)
 	}
 
+	if !*quiet {
+		for _, r := range results {
+			fmt.Fprintf(os.Stderr,
+				"sigscan: rule_set_version=%s file_id=%s status=%s mode=%s read=%d processed=%d reused=%d size=%d verify_read=%d probe=%s hits=%d duration_ms=%d\n",
+				r.RuleVersion, r.FileID, r.Status, r.Stats.Mode,
+				r.Stats.BytesRead, r.Stats.BytesProcessed, r.Stats.BytesReused,
+				r.Stats.FileSize, r.Stats.VerifyBytesRead, r.Stats.ResumeProbe,
+				len(r.Hits), r.Stats.DurationMS)
+		}
+	}
+
 	for _, r := range results {
-		if r.Status != engine.StatusOK {
+		if !r.Status.IsOK() {
 			os.Exit(2)
 		}
 	}
